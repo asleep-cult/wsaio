@@ -203,7 +203,7 @@ class Stream:
             self.transport.close()
 
     def is_closing(self):
-        return self.transport.is_closing()
+        return self.transport is None or self.transport.is_closing()
 
     async def wait_until_drained(self):
         await self.protocol.wait_until_drained()

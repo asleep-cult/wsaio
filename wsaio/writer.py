@@ -16,6 +16,9 @@ class WebSocketWriter:
 
             mask (bool): Whether to send the frame with a mask.
         """
+        if self.stream.is_closing():
+            raise RuntimeError('Cannot write to a closing transport')
+
         if not isinstance(frame, wsframe.WebSocketFrame):
             raise TypeError(f'frame should be a WebSocketFrame, got {type(frame).__name__!r}')
 

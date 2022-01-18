@@ -35,8 +35,9 @@ class WebSocketClient:
     async def _close_hook(self, code, data):
         if not self._closing:
             await self.close(code=code)
+        else:
+            self.stream.close()
 
-        self.stream.close()
         self._opened = False
 
         await self.on_close(code, data)
