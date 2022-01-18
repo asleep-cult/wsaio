@@ -1,3 +1,5 @@
 __pycache__
 atest.py
 fuzzingserver.json
+dist
+*.egg-info
