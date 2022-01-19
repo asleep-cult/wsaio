@@ -19,9 +19,9 @@ async def main(loop):
     client = EchoClient(loop=loop)
 
     await client.connect('wss://localhost/helloWorld')
-    await client.wait_until_closed()
 
 
 loop = asyncio.get_event_loop()
-loop.run_until_complete(main(loop))
+loop.create_task(main())
+loop.run_forever()
 ```
