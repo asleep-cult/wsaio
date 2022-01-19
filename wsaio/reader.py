@@ -1,10 +1,12 @@
-from codecs import getincrementaldecoder
+from codecs import IncrementalDecoder, getincrementaldecoder
 from contextlib import contextmanager
 from io import BytesIO, StringIO
+from typing import Awaitable, Callable, Generator, Optional, Union
 
-from . import frame as wsframe
-from . import util
-from .exceptions import InvalidFrameError
+from . import secrets
+from .exceptions import FrameDecodeError
+from .frame import WebSocketCloseCode, WebSocketFrame, WebSocketOpcode
+from .stream import Stream, StreamReader
 
 _INVALID_OPCODE_MSG = 'The WebSocket received a frame with an invalid or unknown opcode: {!r}'
 _MISSING_CLOSE_CODE_MSG = 'The WebSocket received a close frame with payload data but no close code'
@@ -34,168 +36,214 @@ _UNEXPECTED_CONT_MSG = (
 
 _IncrementalDecoder = getincrementaldecoder('utf-8')
 
+PingCallbackT = Callable[[bytes], Awaitable[None]]
+PongCallbackT = Callable[[bytes], Awaitable[None]]
+TextCallbackT = Callable[[str], Awaitable[None]]
+BinaryCallbackT = Callable[[bytes], Awaitable[None]]
+CloseCallbackT = Callable[[bytes, int], Awaitable[None]]
+
 
 class WebSocketReader:
-    """A class for reading WebSocket frames from a stream."""
-
-    def __init__(self, *, stream):
+    def __init__(self, stream: Stream) -> None:
         self.stream = stream
 
-        self._fragment_buffer = None
-        self._fragment_decoder = None
-        self._fragmented_frame = None
+        self.on_ping: Optional[PingCallbackT] = None
+        self.on_pong: Optional[PongCallbackT] = None
+        self.on_text: Optional[TextCallbackT] = None
+        self.on_binary: Optional[BinaryCallbackT] = None
+        self.on_close: Optional[CloseCallbackT] = None
 
-        self._on_ping = None
-        self._on_pong = None
-        self._on_text = None
-        self._on_binary = None
-        self._on_close = None
+        self._fragment_buffer: Optional[Union[StringIO, BytesIO]] = None
+        self._fragment_decoder: Optional[IncrementalDecoder] = None
+        self._fragmented_frame: Optional[WebSocketFrame] = None
 
-    def __repr__(self):
-        return f'<{self.__class__.__name__} stream={self.stream!r}>'
+    def _run_callback(self, frame: WebSocketFrame) -> None:
+        if frame.opcode == WebSocketOpcode.PING:
+            assert self.on_ping is not None
+            coro = self.on_ping(frame.get_bytes())
 
-    @contextmanager
-    def _suppress_decode_error(self):
-        try:
-            yield
-        except UnicodeDecodeError:
-            raise InvalidFrameError(_NON_UTF_8_MSG, wsframe.WS_INVALID_PAYLOAD_DATA)
+        elif frame.opcode == WebSocketOpcode.PONG:
+            assert self.on_pong is not None
+            coro = self.on_pong(frame.get_bytes())
 
-    def _run_callback(self, frame):
-        if frame.is_ping():
-            coro = self._on_ping(frame.data)
-        elif frame.is_pong():
-            coro = self._on_pong(frame.data)
-        elif frame.is_text():
-            coro = self._on_text(frame.data)
-        elif frame.is_binary():
-            coro = self._on_binary(frame.data)
-        elif frame.is_close():
-            coro = self._on_close(frame.code, frame.data)
+        elif frame.opcode == WebSocketOpcode.TEXT:
+            assert self.on_text is not None
+            coro = self.on_text(frame.get_string())
+
+        elif frame.opcode == WebSocketOpcode.BINARY:
+            assert self.on_binary is not None
+            coro = self.on_binary(frame.get_bytes())
+
+        elif frame.opcode == WebSocketOpcode.CLOSE:
+            assert self.on_close is not None
+            assert frame.code is not None
+            coro = self.on_close(frame.get_bytes(), frame.code)
+
+        else:
+            raise ValueError('Invalid frame opcode')
 
         self.stream.loop.create_task(coro)
 
-    def _setup_fragmenter(self, frame, data):
+    @contextmanager
+    def _catch_decode_error(self):
+        try:
+            yield
+        except UnicodeDecodeError:
+            raise FrameDecodeError(_NON_UTF_8_MSG, WebSocketCloseCode.INVALID_PAYLOAD_DATA)
+
+    def _init_fragmenter(self, frame: WebSocketFrame, data: bytes) -> None:
         self._fragmented_frame = frame
-        if frame.is_text():
-            self._fragment_decoder = _IncrementalDecoder()
+
+        if frame.opcode == WebSocketOpcode.TEXT:
             self._fragment_buffer = StringIO()
+            self._fragment_decoder = _IncrementalDecoder()
         else:
             self._fragment_buffer = BytesIO()
 
         self._write_fragment(data)
 
-    def _write_fragment(self, data):
-        if self._fragment_decoder is not None:
-            data = self._fragment_decoder.decode(data)
-        self._fragment_buffer.write(data)
+    def _write_fragment(self, data: bytes) -> None:
+        assert self._fragmented_frame is not None
 
-    def _reset_fragmenter(self):
-        self._fragmented_frame = None
+        if self._fragmented_frame.opcode == WebSocketOpcode.TEXT:
+            assert isinstance(self._fragment_buffer, StringIO)
+            assert self._fragment_decoder is not None
+
+            self._fragment_buffer.write(self._fragment_decoder.decode(data))
+        else:
+            assert isinstance(self._fragment_buffer, BytesIO)
+
+            self._fragment_buffer.write(data)
+
+    def _reset_fragmenter(self) -> None:
         self._fragment_buffer = None
         self._fragment_decoder = None
+        self._fragmented_frame = None
 
-    def read_frame(self, ctx):
-        fbyte, sbyte = yield from ctx.read(2)
+    def frame_parser(self, reader: StreamReader) -> Generator[None, None, None]:
+        while True:
+            fbyte, sbyte = yield from reader.read(2)
 
-        masked = (sbyte >> 7) & 1
-        length = sbyte & ~(1 << 7)
+            masked = (sbyte >> 7) & 1
+            length = sbyte & ~(1 << 7)
 
-        frame = wsframe.WebSocketFrame.from_head(fbyte)
+            frame = WebSocketFrame.from_head(fbyte)
 
-        if frame.op not in wsframe.WS_OPS:
-            raise InvalidFrameError(_INVALID_OPCODE_MSG.format(frame.op), wsframe.WS_PROTOCOL_ERROR)
+            try:
+                WebSocketOpcode(frame.opcode)
+            except ValueError:
+                raise FrameDecodeError(
+                    _INVALID_OPCODE_MSG.format(frame.opcode), WebSocketCloseCode.PROTOCOL_ERROR
+                )
 
-        if any((frame.rsv1, frame.rsv2, frame.rsv3)):
-            raise InvalidFrameError(_MEANINGLESS_RSV_BITS_MSG, wsframe.WS_PROTOCOL_ERROR)
+            if any((frame.rsv1, frame.rsv2, frame.rsv3)):
+                raise FrameDecodeError(
+                    _MEANINGLESS_RSV_BITS_MSG, WebSocketCloseCode.PROTOCOL_ERROR
+                )
 
-        if frame.is_control():
-            yield from self._handle_control_frame(ctx, frame, masked, length)
+            if frame.is_control():
+                yield from self._handle_control_frame(reader, frame, masked, length)
+            else:
+                yield from self._handle_data_frame(reader, frame, masked, length)
+
+    def _read_length(self, reader: StreamReader, bits: int) -> Generator[None, None, int]:
+        if bits == 126:
+            data = yield from reader.read(2)
+        elif bits == 127:
+            data = yield from reader.read(8)
         else:
-            yield from self._handle_data_frame(ctx, frame, masked, length)
+            if bits > 127:  # XXX: Is this even possible?
+                raise FrameDecodeError(_INVALID_LENGTH_MSG, WebSocketCloseCode.PROTOCOL_ERROR)
 
-    def _read_length(self, ctx, length):
-        if length == 126:
-            data = yield from ctx.read(2)
-        elif length == 127:
-            data = yield from ctx.read(8)
-        else:
-            if length > 127:  # XXX: Is this even possible?
-                raise InvalidFrameError(_INVALID_LENGTH_MSG, wsframe.WS_PROTOCOL_ERROR)
-
-            return length
+            return bits
 
         return int.from_bytes(data, 'big', signed=False)
 
-    def _read_payload(self, ctx, length, masked):
+    def _read_payload(
+        self, reader: StreamReader, length: int, masked: int
+    ) -> Generator[None, None, bytes]:
         if masked:
-            mask = yield from ctx.read(4)
-            data = yield from ctx.read(length)
-            return util.mask(data, mask)
-        else:
-            data = yield from ctx.read(length)
-            return data
+            mask = yield from reader.read(4)
+            data = yield from reader.read(length)
+            return secrets.mask(data, mask)
 
-    def _set_close_code(self, frame, data):
+        data = yield from reader.read(length)
+        return data
+
+    def _set_close_code(self, frame: WebSocketFrame, data: bytes) -> bytes:
         if not data:
+            frame.set_code(WebSocketCloseCode.GOING_AWAY)
             return b''
         elif len(data) < 2:
-            raise InvalidFrameError(_MISSING_CLOSE_CODE_MSG, wsframe.WS_PROTOCOL_ERROR)
+            raise FrameDecodeError(_MISSING_CLOSE_CODE_MSG, WebSocketCloseCode.PROTOCOL_ERROR)
 
         code = int.from_bytes(data[:2], 'big', signed=False)
 
-        if not wsframe.is_close_code(code):
-            raise InvalidFrameError(_INVALID_CLOSE_CODE_MSG.format(code), wsframe.WS_PROTOCOL_ERROR)
+        try:
+            WebSocketCloseCode.from_code(code)
+        except ValueError:
+            raise FrameDecodeError(
+                _INVALID_CLOSE_CODE_MSG.format(code), WebSocketCloseCode.PROTOCOL_ERROR
+            )
 
         frame.set_code(code)
-
         return data[2:]
 
-    def _handle_control_frame(self, ctx, frame, masked, length):
+    def _handle_control_frame(
+        self, reader: StreamReader, frame: WebSocketFrame, masked: int, length: int
+    ) -> Generator[None, None, None]:
         if not frame.fin:
-            raise InvalidFrameError(_FRAGMENTED_CONTROL_MSG, wsframe.WS_PROTOCOL_ERROR)
+            raise FrameDecodeError(_FRAGMENTED_CONTROL_MSG, WebSocketCloseCode.PROTOCOL_ERROR)
 
         if length > 125:
-            raise InvalidFrameError(_LARGE_CONTROL_MSG.format(length), wsframe.WS_PROTOCOL_ERROR)
+            raise FrameDecodeError(
+                _LARGE_CONTROL_MSG.format(length), WebSocketCloseCode.PROTOCOL_ERROR
+            )
 
-        data = yield from self._read_payload(ctx, length, masked)
+        data = yield from self._read_payload(reader, length, masked)
 
-        if frame.is_close():
+        if frame.opcode == WebSocketOpcode.CLOSE:
             data = self._set_close_code(frame, data)
 
-            with self._suppress_decode_error():
+            with self._catch_decode_error():
                 frame.set_data(data.decode('utf-8'))
         else:
             frame.set_data(data)
 
         self._run_callback(frame)
 
-    def _handle_data_frame(self, ctx, frame, masked, length):
-        length = yield from self._read_length(ctx, length)
-        data = yield from self._read_payload(ctx, length, masked)
+    def _handle_data_frame(
+        self, reader: StreamReader, frame: WebSocketFrame, masked: int, length: int
+    ) -> Generator[None, None, None]:
+        length = yield from self._read_length(reader, length)
+        data = yield from self._read_payload(reader, length, masked)
 
-        if frame.is_continuation():
+        if frame.opcode == WebSocketOpcode.CONTINUATION:
             if self._fragmented_frame is None:
-                raise InvalidFrameError(_UNEXPECTED_CONT_MSG, wsframe.WS_PROTOCOL_ERROR)
+                raise FrameDecodeError(_UNEXPECTED_CONT_MSG, WebSocketCloseCode.PROTOCOL_ERROR)
 
-            with self._suppress_decode_error():
+            with self._catch_decode_error():
                 self._write_fragment(data)
+
         elif self._fragmented_frame is not None:
-            raise InvalidFrameError(_EXPECTED_CONT_MSG, wsframe.WS_PROTOCOL_ERROR)
+            raise FrameDecodeError(_EXPECTED_CONT_MSG, WebSocketCloseCode.PROTOCOL_ERROR)
 
         if not frame.fin:
             if self._fragmented_frame is None:
-                with self._suppress_decode_error():
-                    self._setup_fragmenter(frame, data)
+                with self._catch_decode_error():
+                    self._init_fragmenter(frame, data)
         else:
             if self._fragmented_frame is not None:
+                assert self._fragment_buffer is not None
+                assert self._fragmented_frame is not None
+
                 frame = self._fragmented_frame
                 data = self._fragment_buffer.getvalue()
                 self._reset_fragmenter()
-            elif frame.is_text():
-                with self._suppress_decode_error():
+
+            elif frame.opcode == WebSocketOpcode.TEXT:
+                with self._catch_decode_error():
                     data = data.decode('utf-8')
 
             frame.set_data(data)
-
             self._run_callback(frame)

@@ -1,33 +1,60 @@
 import asyncio
+import traceback
 
 from wsaio.client import WebSocketClient
 
 
-class TestClient(WebSocketClient):
+class EchoClient(WebSocketClient):
+    def __init__(self, *, loop=None):
+        super().__init__(loop=loop)
+        self.event = asyncio.Event()
+
     async def on_text(self, data):
-        await self.write(data)
+        await self.send(data)
 
     async def on_binary(self, data):
-        await self.write(data, binary=True)
+        await self.send(data, binary=True)
+
+    async def on_closed(self, exc):
+        self.event.set()
 
 
-async def main(loop):
+class CasesClient(WebSocketClient):
+    def __init__(self, *, loop=None):
+        super().__init__(loop=loop)
+        self.event = asyncio.Event()
+
+    def on_text(self, data: str) -> None:
+        self.cases = int(data)
+        self.event.set()
+
+
+async def main():
+    cases = CasesClient()
+    await cases.connect('ws://127.0.0.1:9001/getCaseCount')
+    await cases.event.wait()
+
     try:
-        for i in range(1, 302):
-            print(f'Running test case {i}')
-            client = TestClient(loop=loop)
-            await client.connect(f'ws://localhost:9001/runCase?case={i}&agent=wsaio')
-
+        for i in range(1, cases.cases):
             try:
-                await asyncio.wait_for(client.stream.wait_until_closed(), timeout=10)
-            except asyncio.TimeoutError:
-                print(f'Test case {i} timed out')
-                client.stream.close()
-                break
+                print(f'Running test case {i}')
+                client = EchoClient()
+                await client.connect(f'ws://127.0.0.1:9001/runCase?case={i}&agent=wsaio')
+
+                try:
+                    await asyncio.wait_for(client.event.wait(), timeout=1000)
+                except asyncio.TimeoutError:
+                    print(f'Test case {i} timed out')
+                    await client.close()
+                    continue
+            except Exception:
+                print(f'Exception in tast case {i}')
+                traceback.print_exc()
+            else:
+                print(f'Completed test case {i}')
     finally:
-        client = TestClient(loop=loop)
+        client = WebSocketClient()
         await client.connect('ws://localhost:9001/updateReports?agent=wsaio')
 
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main(loop))
+asyncio.run(main())

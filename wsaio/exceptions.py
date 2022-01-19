@@ -1,13 +1,9 @@
-class InvalidDataError(Exception):
-    pass
-
-
-class InvalidFrameError(InvalidDataError):
-    def __init__(self, message, code):
+class FrameDecodeError(Exception):
+    def __init__(self, message: str, code: int) -> None:
         self.message = message
         self.code = code
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.message
 
 

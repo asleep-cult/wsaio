@@ -1,33 +1,34 @@
-import asyncio
+from __future__ import annotations
 
-from .exceptions import InvalidDataError
-from .util import getbytes
+import asyncio
+from typing import Any, Awaitable, Callable, Generator, Optional
+
+StreamParserT = Callable[['StreamReader'], Generator[None, None, None]]
+StreamErrorHandlerT = Callable[[Exception], Awaitable[None]]
+ClosedCallbackT = Callable[[Optional[asyncio.Future[None]]], None]
 
 
 class StreamProtocol(asyncio.Protocol):
-    def __init__(self, stream):
-        self.loop = stream.loop
-        self.transport = None
-
-        self._stream = stream
-
-        self._over_ssl = False
+    def __init__(self, stream: Stream) -> None:
+        self.stream = stream
+        self.loop = self.stream.loop
 
         self._paused = False
         self._connection_lost = False
-        self._drain_waiter = None
 
+        self._drain_waiter = None
         self._close_waiter = self.loop.create_future()
 
-    def connection_made(self, transport):
-        self.transport = transport
-        self._over_ssl = transport.get_extra_info('sslcontext') is not None
+        self.transport = None
 
-    def pause_writing(self):
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport
+
+    def pause_writing(self) -> None:
         assert not self._paused
         self._paused = True
 
-    def resume_writing(self):
+    def resume_writing(self) -> None:
         assert self._paused
         self._paused = False
 
@@ -37,18 +38,7 @@ class StreamProtocol(asyncio.Protocol):
 
             self._drain_waiter = None
 
-    def data_received(self, data):
-        self._stream._ctx.feed_data(data)
-
-    def eof_received(self):
-        self._stream._ctx.feed_eof()
-        if self._over_ssl:
-            return False
-        return True
-
-    def connection_lost(self, exc):
-        self._connection_lost = True
-
+    def connection_lost(self, exc: Optional[Exception]) -> None:
         if self._paused and self._drain_waiter is not None:
             if not self._drain_waiter.done():
                 if exc is not None:
@@ -62,151 +52,149 @@ class StreamProtocol(asyncio.Protocol):
             else:
                 self._close_waiter.set_result(None)
 
-        self.transport = None
+    def data_received(self, data: bytes) -> None:
+        self.stream.feed_data(data)
 
-    async def wait_until_drained(self):
-        if self._connection_lost:
+    def eof_received(self) -> Optional[bool]:
+        self.stream.feed_eof()
+        assert self.transport is not None
+
+        ctx = self.transport.get_extra_info('ssl_context')
+        return ctx is not None
+
+    def add_closed_callback(self, callback: ClosedCallbackT) -> None:
+        self._close_waiter.add_done_callback(callback)
+
+    async def wait_for_drain(self) -> None:
+        if self._close_waiter.done():
             raise ConnectionResetError('Connection lost')
 
         if self._paused:
-            assert self._drain_waiter is None or self._drain_waiter.cancelled()
+            assert (
+                self._drain_waiter is None
+                or self._drain_waiter.done()
+            )
 
             self._drain_waiter = self.loop.create_future()
             await self._drain_waiter
 
-    async def wait_until_closed(self):
+    async def wait_for_close(self) -> None:
         await self._close_waiter
 
 
-class StreamParserContext:
-    def __init__(self, stream):
+class StreamReader:
+    def __init__(self, stream: Stream) -> None:
         self.stream = stream
+        self.buffer = bytearray()
+        self.parser = None
 
-        self.reset_parser()
-        self._parser = None
+    def set_parser(self, parser: Optional[StreamParserT]) -> None:
+        if parser is not None:
+            self.parser = parser(self)
+            self.step_parser(None)
+        else:
+            self.parser = None
 
-        self._error_handler = None
+    def step_parser(self, data: Optional[bytes]) -> None:
+        if data is not None:
+            self.buffer.extend(data)
 
-        self._buffer = bytearray()
+        if self.parser is not None:
+            try:
+                self.parser.send(None)
+            except StopIteration:
+                pass
+            except Exception as exc:
+                self.stream.call_error_handler(exc)
 
-    def _step_parser(self, arg):
-        try:
-            self._parser.send(arg)
-        except InvalidDataError as exc:
-            if self._error_handler is not None:
-                self.stream.loop.create_task(self._error_handler(exc))
-            else:
-                raise
+    def fill(self) -> Generator[None, None, None]:
+        yield
 
-    def _fail_parser(self, error):
-        try:
-            self._parser.throw(error)
-        except Exception as exc:
-            if self._error_handler is not None:
-                self.loop.create_task(self._error_handler(exc))
-            else:
-                raise
-
-    def _initialize_parser(self):
-        if self._parser is None:
-            while True:
-                self._parser = self._parsefunc(self)
-
-                try:
-                    self._step_parser(None)
-                except StopIteration:
-                    continue
-                else:
-                    break
-
-    def set_error_handler(self, func):
-        self._error_handler = func
-
-    def set_parser(self, func):
-        self._parsefunc = func
-        self._parser = None
-        self._initialize_parser()
-
-    def reset_parser(self):
-        self.set_parser(StreamParserContext.fill)
-
-    def get_buffer(self):
-        return self._buffer
-
-    def fill(self):
-        data = yield
-        self._buffer.extend(data)
-
-    def read(self, amount):
-        while len(self._buffer) < amount:
+    def read(self, n: int) -> Generator[None, None, bytes]:
+        while len(self.buffer) < n:
             yield from self.fill()
 
-        data = bytes(self._buffer[:amount])
-        del self._buffer[:amount]
+        data = self.buffer[:n]
+        del self.buffer[:n]
 
-        return data
-
-    def feed_data(self, data):
-        try:
-            self._step_parser(data)
-        except StopIteration:
-            self._parser = None
-            self._initialize_parser()
-
-    def feed_eof(self):
-        self._fail_parser(EOFError)
+        return bytes(data)
 
 
 class Stream:
-    def __init__(self, *, loop):
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
-        self.protocol = None
+        self.transport: Optional[asyncio.Transport] = None
+        self.protocol: Optional[StreamProtocol] = None
+        self.connected = False
 
-        self._ctx = StreamParserContext(self)
+        self._reader = StreamReader(self)
+        self._error_handler = None
 
-    def __repr__(self):
-        attrs = [
-            ('protocol', self.protocol),
-            ('transport', self.transport),
-        ]
-        inner = ', '.join(f'{name}={value}' for name, value in attrs)
-        return f'<{self.__class__.__name__} {inner}>'
-
-    @property
-    def transport(self):
-        if self.protocol is not None:
-            return self.protocol.transport
-
-    async def create_protocol(self, host, port, **kwargs):
-        _, self.protocol = await self.loop.create_connection(
-            lambda: StreamProtocol(self), host, port, **kwargs
+    async def create_connection(self, host: str, post: int, **kwargs: Any) -> None:
+        transport, protocol = await self.loop.create_connection(
+            lambda: StreamProtocol(self), host, post, **kwargs
         )
-        return self.protocol
 
-    def set_parser(self, parser):
-        self._ctx.set_parser(parser)
+        assert isinstance(transport, asyncio.Transport)
+        assert isinstance(protocol, StreamProtocol)
 
-    def set_error_handler(self, func):
-        self._ctx.set_error_handler(func)
+        self.transport, self.protocol = transport, protocol
+        self.connected = True
 
-    def write(self, data):
-        self.transport.write(getbytes(data))
+    def feed_data(self, data: bytes) -> None:
+        self._reader.step_parser(data)
 
-    def writelines(self, data):
-        self.transport.writelines(getbytes(line) for line in data)
+    def feed_eof(self) -> None:
+        return None
 
-    def can_write_eof(self):
-        return self.transport.can_write_eof()
+    def set_parser(self, parser: Optional[StreamParserT]) -> None:
+        self._reader.set_parser(parser)
 
-    def close(self):
-        if self.transport is not None:
+    def set_error_handler(self, handler: StreamErrorHandlerT) -> None:
+        self._error_handler = handler
+
+    def call_error_handler(self, exc: Exception) -> None:
+        if self._error_handler is not None:
+            self.loop.create_task(self._error_handler(exc))
+        else:
+            self.loop.call_exception_handler({
+                'message': 'Unhandled exception in stream',
+                'exception': exc,
+                'stream': self,
+            })
+
+    def write(self, data: bytes) -> None:
+        if not self.connected:
+            raise RuntimeError('cannot write to stream because it is not connected')
+
+        assert self.transport is not None
+
+        self.transport.write(data)
+
+    def add_closed_callback(self, callback: ClosedCallbackT) -> None:
+        if not self.connected:
+            raise RuntimeWarning(
+                'cannot add closed callback because stream is not connected'
+            )
+
+        assert self.protocol is not None
+
+        self.protocol.add_closed_callback(callback)
+
+    async def close(self) -> None:
+        if not self.connected:
+            raise RuntimeError('cannot close stream because it is not connected')
+
+        assert (
+            self.transport is not None
+            and self.protocol is not None
+        )
+
+        if not self.transport.is_closing():
             self.transport.close()
 
-    def is_closing(self):
-        return self.transport is None or self.transport.is_closing()
+        await self.protocol.wait_for_close()
 
-    async def wait_until_drained(self):
-        await self.protocol.wait_until_drained()
-
-    async def wait_until_closed(self):
-        await self.protocol.wait_until_closed()
+    async def drain(self) -> None:
+        if self.protocol is not None:
+            await self.protocol.wait_for_drain()
